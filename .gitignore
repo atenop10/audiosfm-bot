@@ -1,0 +1,9 @@
+# NEVER commit secrets or runtime files
+.env
+*.session
+*.session-journal
+settings.json
+work/
+venv/
+__pycache__/
+*.pyc
