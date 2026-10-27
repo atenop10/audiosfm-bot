@@ -4,7 +4,8 @@ Nothing on the website is changed, and the bot needs **no database password and 
 It logs in to `r2admin.php` with your admin PIN (like a browser) and uses your existing `r2_upload_api.php`
 multipart upload, so every episode is saved exactly the way the admin page saves it.
 
-Flow: Telegram → VPS download → ffmpeg compress → auto-rename (`Ep 001.mp3`) → direct upload to R2 → episode saved by the site.
+Flow, **one file at a time**: download from Telegram → ffmpeg compress → auto-rename (`Ep 001.mp3`) → upload to R2 → episode saved by the site → delete the temp file → next file.
+Only one episode is ever on the VPS disk at once (a ZIP is kept until its files are done).
 
 ## Quick start with GitHub (recommended)
 
@@ -40,6 +41,26 @@ sudo systemctl stop audiosfm-bot     # stop
 ---
 (Manual installation steps below, if you prefer not to use the script.)
 
+## Run more than one bot on the same VPS
+Each extra bot has its own Telegram token, settings and queue, but shares this code and the Python environment.
+1. In Telegram, create a **new bot** with @BotFather and copy its token (a token can't be shared between bots).
+2. On the VPS:
+```bash
+cd ~/audiosfm-bot
+sudo bash add_bot.sh second        # "second" is just a name you choose
+```
+It asks for the new token; press **Enter** on the other questions to copy the main bot's values
+(or type a different site URL / PIN / allowed user for a different website).
+Its files live in `instances/second/` (never uploaded to GitHub).
+
+```bash
+journalctl -u audiosfm-bot-second -f          # logs of that bot
+sudo systemctl restart audiosfm-bot-second    # restart it
+sudo systemctl disable --now audiosfm-bot-second   # stop & remove from auto-start
+```
+`sudo bash update.sh` updates the code and restarts **all** bots at once.
+
+---
 ## Install on the VPS (Ubuntu/Debian)
 ```bash
 sudo apt update && sudo apt install -y ffmpeg python3-pip python3-venv
@@ -79,6 +100,8 @@ WantedBy=multi-user.target
 ```
 Commands: `/stories /select /newstory /poster /info /queue /go /clear /cancel /compress /bitrate /mono /rename /mode`
 
+`/rename off` keeps your original file names; `/rename on` goes back to the pattern.
+
 - Compression: MP3 64 kbps mono 44.1 kHz, metadata stripped (`/bitrate`, `/mono`, `/compress off`). MP3s already ≤ target are not re-encoded.
 - Naming: `/rename Ep {n:03d}` → `Ep 001.mp3`. The website numbers episodes in upload order (last + 1), so the bot sorts files
   naturally (Ep 2 before Ep 10) and names each one with the number the site will give it.
@@ -91,3 +114,5 @@ Commands: `/stories /select /newstory /poster /info /queue /go /clear /cancel /c
 - The bot behaves like one admin session. If you log in to the admin panel in a browser at the same time, that's fine.
 - Numbering assumes the story has no gaps (count = last episode number), which matches your current data.
 - If you change the admin PIN, update `ADMIN_PIN` in `.env`. Keep `.env` private.
+
+- **Failures never drop a file:** each file is retried 3 times; if it still fails the bot stops (`/onfail stop`, default) and keeps that file and the rest in the queue — send `/go` to continue from it. `/onfail skip` keeps going and leaves the failed file queued.

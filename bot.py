@@ -11,18 +11,21 @@ from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import BotCommand, Message
 
-load_dotenv()
+load_dotenv(os.environ.get("ENV_FILE", ".env"))  # ENV_FILE lets one VPS run several bots from this code
 ENV = os.environ
 ADMINS = {int(x) for x in ENV.get("ADMIN_IDS", "").split(",") if x.strip()}
-WORK = Path("work"); WORK.mkdir(exist_ok=True)
-SETTINGS_FILE = Path("settings.json")
+DATA = Path(ENV.get("DATA_DIR", ".")); DATA.mkdir(parents=True, exist_ok=True)  # per-bot folder: session, settings, temp files
+WORK = DATA / "work"; WORK.mkdir(exist_ok=True)
+SETTINGS_FILE = DATA / "settings.json"
+PENDING = DATA / "pending"; shutil.rmtree(PENDING, ignore_errors=True); PENDING.mkdir(exist_ok=True)  # unpacked ZIP files waiting in the queue
+RETRIES = 3
 AUDIO_EXT = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".opus", ".flac", ".webm"}
 
-app = Client("audiosfm_bot", api_id=int(ENV["API_ID"]), api_hash=ENV["API_HASH"], bot_token=ENV["BOT_TOKEN"], workdir=".")
+app = Client("audiosfm_bot", api_id=int(ENV["API_ID"]), api_hash=ENV["API_HASH"], bot_token=ENV["BOT_TOKEN"], workdir=str(DATA))
 # ---------------- per-user state ----------------
 DEFAULTS = {"bitrate": int(ENV.get("DEFAULT_BITRATE", 64)), "mono": ENV.get("DEFAULT_MONO", "1") == "1",
-            "compress": True, "pattern": ENV.get("DEFAULT_NAME_PATTERN", "Ep {n:03d}"),
-            "rename": True, "mode": "detect", "start": 0, "story_id": None}
+            "compress": ENV.get("DEFAULT_COMPRESS", "0") == "1", "pattern": ENV.get("DEFAULT_NAME_PATTERN", "Ep {n:03d}"),
+            "rename": True, "onfail": "stop", "mode": "detect", "start": 0, "story_id": None}
 _settings = json.loads(SETTINGS_FILE.read_text()) if SETTINGS_FILE.exists() else {}
 queues: dict[int, list[Message]] = {}
 running: dict[int, bool] = {}
@@ -198,13 +201,14 @@ HELP = """<b>🎧 AUDIOS FM Upload Bot</b>
 /cancel – stop after the current file
 
 <b>Compression</b>
-/compress on|off – re-encode to MP3 (default on)
+/compress on|off – re-encode to MP3 (default OFF: files are uploaded exactly as sent)
 /bitrate 64 – target kbps (32–192)
 /mono on|off – mono output (smaller, great for stories)
 
 <b>Auto rename / numbering</b>
 /rename off|on – keep original file names, or auto-rename
 /rename Ep {n:03d} – name pattern → “Ep 001.mp3” (current site style)
+/onfail stop|skip – if a file fails 3 times: stop here (default) or continue; the failed file always stays in the queue
 /mode detect|seq – <code>detect</code>: skip files whose Ep number is already on the site (safe to resend); <code>seq</code>: upload everything
 
 <i>Episodes are numbered by the website in upload order (next number after the last episode).</i>"""
@@ -269,7 +273,7 @@ async def cmd_poster(c, m):
 async def cmd_info(c, m):
     s = S(m.from_user.id)
     await m.reply_text(f"<b>Active story:</b> {s['story_id'] or 'none'}\n<b>Compress:</b> {'on' if s['compress'] else 'off'} · {s['bitrate']} kbps · {'mono' if s['mono'] else 'stereo'}\n"
-                       f"<b>Rename:</b> {('ON · <code>' + s['pattern'] + '</code>') if s['rename'] else 'OFF (original names)'}\n<b>Mode:</b> {s['mode']}\n<b>Queued:</b> {len(queues.get(m.from_user.id, []))}")
+                       f"<b>Rename:</b> {('ON · <code>' + s['pattern'] + '</code>') if s['rename'] else 'OFF (original names)'}\n<b>Mode:</b> {s['mode']} · <b>On failure:</b> {s['onfail']}\n<b>Queued:</b> {len(queues.get(m.from_user.id, []))}")
 
 def _toggle(key):
     async def h(c, m):
@@ -299,6 +303,13 @@ async def cmd_rename(c, m):
     if not pat or sample is None or "{n" not in pat: return await m.reply_text("Usage:\n/rename off – keep original names\n/rename on – use pattern\n/rename Ep {n:03d} – set pattern (must contain {n})")
     S(m.from_user.id).update(pattern=pat, rename=True); save(); await m.reply_text(f"✅ Pattern saved & rename ON. Example: <code>{sample}.mp3</code>")
 
+@app.on_message(filters.command("onfail") & filters.private)
+@admin_only
+async def cmd_onfail(c, m):
+    a = m.command[1].lower() if len(m.command) > 1 else ""
+    if a not in ("stop", "skip"): return await m.reply_text("Usage: /onfail stop|skip\n<b>stop</b> (default): after 3 failed tries, stop and keep the file + the rest in the queue (episode order stays correct).\n<b>skip</b>: keep the failed file in the queue and continue with the next ones.")
+    S(m.from_user.id)["onfail"] = a; save(); await m.reply_text(f"✅ On failure = {a}")
+
 @app.on_message(filters.command("mode") & filters.private)
 @admin_only
 async def cmd_mode(c, m):
@@ -316,7 +327,11 @@ async def cmd_queue(c, m):
 
 @app.on_message(filters.command("clear") & filters.private)
 @admin_only
-async def cmd_clear(c, m): queues[m.from_user.id] = []; await m.reply_text("🗑 Queue cleared.")
+async def cmd_clear(c, m):
+    if running.get(m.from_user.id): return await m.reply_text("⏳ Upload running — /cancel first, then /clear.")
+    for x in queues.get(m.from_user.id, []):
+        if isinstance(x, LocalFile): x.path.unlink(missing_ok=True)
+    queues[m.from_user.id] = []; await m.reply_text("🗑 Queue cleared.")
 
 @app.on_message(filters.command("cancel") & filters.private)
 @admin_only
@@ -324,7 +339,12 @@ async def cmd_cancel(c, m):
     cancel[m.from_user.id] = True; await m.reply_text("🛑 Will stop after the current file.")
 
 # ---------------- receiving files ----------------
-def fname(m: Message) -> str:
+class LocalFile:
+    """A file already on the VPS (unpacked from a ZIP) waiting in the queue."""
+    def __init__(self, name: str, path: Path): self.name, self.path = name, path
+
+def fname(m) -> str:
+    if isinstance(m, LocalFile): return m.name
     media = m.audio or m.document or m.voice
     return getattr(media, "file_name", None) or f"voice_{m.id}.ogg"
 
@@ -362,7 +382,7 @@ async def compress(src: Path, dst: Path, s: dict) -> Path:
 
 def extract_zip(p: Path, ex: Path) -> list[Path]:
     """Safely extract only audio files from a ZIP (no path traversal). Returns files in natural order."""
-    ex.mkdir(exist_ok=True)
+    ex.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(p) as z:
         for zi in z.infolist():
             nm = Path(zi.filename).name
@@ -385,8 +405,9 @@ async def cmd_go(c, m: Message):
     running[uid] = True; cancel[uid] = False
     tmp = WORK / f"job_{uid}_{int(time.time())}"; tmp.mkdir(parents=True)
     status = await m.reply_text("🚀 Starting…")
-    ok, skipped, failed = [], [], []
+    ok, skipped, failed, deferred = [], [], [], []
     st = {"k": 0, "total": len(queues[uid]), "saved": 0, "nxt": 1, "start": 0}
+    stopped_at = None
     try:
         info = (await asyncio.to_thread(api, "story_info", story_id=s["story_id"]))["story"]
         st["start"] = info["episodes"]; st["nxt"] = info["episodes"] + 1  # site numbers episodes in upload order
@@ -396,79 +417,116 @@ async def cmd_go(c, m: Message):
             det = detect_number(orig)
             return det if (s["mode"] == "detect" and det is not None and det <= st["start"]) else None
 
-        async def handle(orig: str, path: Path):
-            """Compress -> upload -> delete, for ONE local file."""
+        async def site_count():
+            return (await asyncio.to_thread(api, "story_info", story_id=info["id"]))["story"]["episodes"]
+
+        async def handle(orig: str, path: Path) -> bool:
+            """Prepare + upload ONE local file with automatic retries. True = done/skipped, False = failed."""
             st["k"] += 1; k = st["k"]
-            try:
-                det = already_on_site(orig)
-                if det is not None:
-                    skipped.append(f"{orig} → Ep {det} already on site"); return
-                base = s["pattern"].format(n=st["nxt"]) if s["rename"] else Path(orig).stem
-                title = base + ".mp3"
-                await safe_edit(status, f"🎚 {k}/{st['total']} · {orig}\n→ <b>{title}</b>\nCompressing…")
-                out = await compress(path, tmp / f"c_{uuid.uuid4().hex[:6]}.mp3", s)
-                is_mp3 = out.suffix.lower() == ".mp3"
-                name = title if is_mp3 else base + out.suffix.lower()
-                mime = "audio/mpeg" if is_mp3 else (mimetypes.guess_type(out.name)[0] or "application/octet-stream")
-                before, after = path.stat().st_size, out.stat().st_size
-                loop_ = asyncio.get_running_loop(); last = [0.0]
-                def prog(n, total):
-                    if time.time() - last[0] < 3 and n < total: return
-                    last[0] = time.time()
-                    asyncio.run_coroutine_threadsafe(safe_edit(status,
-                        f"☁️ {k}/{st['total']} · {name}\n{human(before)} → {human(after)}\nUploading part {n}/{total}…"), loop_)
-                await safe_edit(status, f"☁️ {k}/{st['total']} · {name}\n{human(before)} → {human(after)}\nUploading…")
-                await asyncio.to_thread(site.upload_episode, info["id"], out, name, mime, prog)
-                st["nxt"] += 1; st["saved"] += before - after
-                ok.append(f"{name} ({human(before)} → {human(after)})")
-                if out != path: out.unlink(missing_ok=True)
-            except Exception as e:
-                failed.append(f"{orig}: {e}")
-            finally:
-                path.unlink(missing_ok=True)   # free disk before the next file
+            det = already_on_site(orig)
+            if det is not None:
+                skipped.append(f"{orig} → Ep {det} already on site"); return True
+            base = s["pattern"].format(n=st["nxt"]) if s["rename"] else Path(orig).stem
+            title = base + ".mp3"
+            last_err = None
+            for attempt in range(1, RETRIES + 1):
+                out = None
+                try:
+                    tag = f" · retry {attempt}/{RETRIES}" if attempt > 1 else ""
+                    await safe_edit(status, f"🎚 {k}/{st['total']} · {orig}\n→ <b>{title}</b>\n{'Compressing…' if s['compress'] else 'Preparing…'}{tag}")
+                    out = await compress(path, tmp / f"c_{uuid.uuid4().hex[:6]}.mp3", s)
+                    is_mp3 = out.suffix.lower() == ".mp3"
+                    name = title if is_mp3 else base + out.suffix.lower()
+                    mime = "audio/mpeg" if is_mp3 else (mimetypes.guess_type(out.name)[0] or "application/octet-stream")
+                    before, after = path.stat().st_size, out.stat().st_size
+                    loop_ = asyncio.get_running_loop(); last = [0.0]
+                    def prog(n, total):
+                        if time.time() - last[0] < 3 and n < total: return
+                        last[0] = time.time()
+                        asyncio.run_coroutine_threadsafe(safe_edit(status,
+                            f"☁️ {k}/{st['total']} · {name}\n{human(before)} → {human(after)}\nUploading part {n}/{total}…{tag}"), loop_)
+                    await safe_edit(status, f"☁️ {k}/{st['total']} · {name}\n{human(before)} → {human(after)}\nUploading…{tag}")
+                    await asyncio.to_thread(site.upload_episode, info["id"], out, name, mime, prog)
+                    st["nxt"] += 1; st["saved"] += before - after
+                    ok.append(f"{name} ({human(before)} → {human(after)})")
+                    if out != path: out.unlink(missing_ok=True)
+                    return True
+                except Exception as e:
+                    last_err = e
+                    if out is not None and out != path: out.unlink(missing_ok=True)
+                    try:  # did the site actually save it even though we got an error? (avoid duplicates)
+                        if await site_count() == st["start"] + len(ok) + 1:
+                            st["nxt"] += 1; ok.append(f"{title} (saved; reply was lost)"); return True
+                    except Exception: pass
+                    if attempt < RETRIES:
+                        await safe_edit(status, f"⚠️ {orig}\n{e}\nRetrying in {5 * attempt}s ({attempt}/{RETRIES})…")
+                        await asyncio.sleep(5 * attempt)
+            failed.append(f"{orig}: {last_err}")
+            return False
 
         while queues[uid] and not cancel.get(uid):
-            msg = queues[uid][0]; orig = fname(msg); is_zip = Path(orig).suffix.lower() == ".zip"
-            # skip already-uploaded episodes BEFORE downloading (saves time & bandwidth)
-            if not is_zip and already_on_site(orig) is not None:
-                st["k"] += 1; skipped.append(f"{orig} → Ep {already_on_site(orig)} already on site"); queues[uid].pop(0); continue
-            k = st["k"] + 1; last_dl = [0.0]; finished = True
-            async def dl_prog(cur, tot):
-                if time.time() - last_dl[0] < 3: return
-                last_dl[0] = time.time()
-                await safe_edit(status, f"⬇️ {k}/{st['total']} · {orig}\n{human(cur)} / {human(tot)}")
-            await safe_edit(status, f"⬇️ {k}/{st['total']} · {orig}\nDownloading…")
-            try:
-                p = Path(await msg.download(file_name=str(tmp / f"{uuid.uuid4().hex[:8]}_{Path(orig).name}"), progress=dl_prog))
-            except Exception as e:
-                st["k"] += 1; failed.append(f"{orig}: download failed ({e})"); queues[uid].pop(0); continue
-            if is_zip:
-                try:
-                    files = await asyncio.to_thread(extract_zip, p, tmp / f"zip_{uuid.uuid4().hex[:6]}")
-                except Exception as e:
-                    st["k"] += 1; failed.append(f"{orig}: bad ZIP ({e})"); p.unlink(missing_ok=True); queues[uid].pop(0); continue
-                p.unlink(missing_ok=True); st["total"] += max(len(files) - 1, 0)
-                for f in files:
-                    if cancel.get(uid): f.unlink(missing_ok=True); finished = False; continue
-                    await handle(f.name, f)
+            item = queues[uid][0]; orig = fname(item)
+            is_local = isinstance(item, LocalFile)
+            is_zip = (not is_local) and Path(orig).suffix.lower() == ".zip"
+            if not is_zip and already_on_site(orig) is not None:   # skip BEFORE downloading
+                st["k"] += 1; skipped.append(f"{orig} → Ep {already_on_site(orig)} already on site")
+                queues[uid].pop(0)
+                if is_local: item.path.unlink(missing_ok=True)
+                continue
+            k = st["k"] + 1; path = None
+            if is_local: path = item.path
             else:
-                await handle(orig, p)
-            if finished: queues[uid].pop(0)   # only a ZIP interrupted by /cancel stays queued
+                last_dl = [0.0]
+                async def dl_prog(cur, tot):
+                    if time.time() - last_dl[0] < 3: return
+                    last_dl[0] = time.time()
+                    await safe_edit(status, f"⬇️ {k}/{st['total']} · {orig}\n{human(cur)} / {human(tot)}")
+                err = None
+                for attempt in range(1, RETRIES + 1):
+                    try:
+                        await safe_edit(status, f"⬇️ {k}/{st['total']} · {orig}\nDownloading…" + (f" · retry {attempt}/{RETRIES}" if attempt > 1 else ""))
+                        path = Path(await item.download(file_name=str(tmp / f"{uuid.uuid4().hex[:8]}_{Path(orig).name}"), progress=dl_prog)); break
+                    except Exception as e:
+                        err = e; path = None
+                        if attempt < RETRIES: await asyncio.sleep(5 * attempt)
+                if path is None:
+                    st["k"] += 1; failed.append(f"{orig}: download failed ({err})")
+                    if s["onfail"] == "stop": stopped_at = orig; break
+                    deferred.append(queues[uid].pop(0)); continue
+            if is_zip:   # unpack into the queue; each file is then handled (and retried) on its own
+                try:
+                    files = await asyncio.to_thread(extract_zip, path, PENDING / uuid.uuid4().hex[:8])
+                except Exception as e:
+                    st["k"] += 1; failed.append(f"{orig}: not a valid ZIP ({e}) — removed from queue")
+                    path.unlink(missing_ok=True); queues[uid].pop(0); continue
+                path.unlink(missing_ok=True); queues[uid].pop(0)
+                queues[uid][0:0] = [LocalFile(f.name, f) for f in files]
+                st["total"] += max(len(files) - 1, 0)
+                if not files: failed.append(f"{orig}: no audio files inside")
+                continue
+            good = await handle(orig, path)
+            if good or not is_local: path.unlink(missing_ok=True)   # downloaded copies are re-downloaded on retry; unpacked ZIP files are kept
+            if good: queues[uid].pop(0)
+            elif s["onfail"] == "stop": stopped_at = orig; break
+            else: deferred.append(queues[uid].pop(0))
 
+        if deferred: queues[uid] = deferred + queues[uid]   # failed files stay in the queue
         try:
-            end_count = (await asyncio.to_thread(api, "story_info", story_id=info["id"]))["story"]["episodes"]
+            end_count = await site_count()
             if end_count - st["start"] != len(ok):
                 failed.append(f"⚠️ Site episode count changed by {end_count - st['start']}, bot uploaded {len(ok)} — check the admin panel")
         except Exception: pass
-        rep = f"✅ <b>Done — {info['title']}</b>\nUploaded: {len(ok)} · Skipped: {len(skipped)} · Failed: {len(failed)}\n💾 Saved ≈ {human(max(st['saved'], 0))}"
+        rep = f"{'⛔' if stopped_at else '✅'} <b>{'Stopped' if stopped_at else 'Done'} — {info['title']}</b>\nUploaded: {len(ok)} · Skipped: {len(skipped)} · Failed: {len(failed)}\n💾 Saved ≈ {human(max(st['saved'], 0))}"
+        if stopped_at: rep += f"\n\n⛔ Stopped at <b>{stopped_at}</b> after {RETRIES} tries. Nothing was lost: it and the rest are still queued.\nFix the problem, then send /go to continue from this file."
         if cancel.get(uid): rep += "\n🛑 Cancelled by you"
         if queues[uid]: rep += f"\n📋 Still queued: {len(queues[uid])} — /go to continue, /clear to empty"
+        if deferred: rep += "\n⚠️ Failed files were skipped; if you upload them later they get later episode numbers."
         if ok: rep += "\n\n" + "\n".join(ok[:25]) + ("\n…" if len(ok) > 25 else "")
         if skipped: rep += "\n\n⏭ <b>Skipped</b>\n" + "\n".join(skipped[:15])
         if failed: rep += "\n\n❌ <b>Failed</b>\n" + "\n".join(failed[:15])
         await safe_edit(status, rep[:4000])
     except Exception as e:
-        await safe_edit(status, f"❌ Job failed: {e}")
+        await safe_edit(status, f"❌ Job failed: {e}\nYour queue is unchanged — send /go to retry.")
     finally:
         running[uid] = False; shutil.rmtree(tmp, ignore_errors=True)
 
@@ -476,7 +534,7 @@ COMMANDS = [("help", "Show all commands"), ("stories", "List / search stories"),
             ("newstory", "Create a story"), ("poster", "Set story poster"), ("info", "Current story & settings"),
             ("queue", "Show queued files"), ("go", "Start uploading the queue"), ("cancel", "Stop after current file"),
             ("clear", "Empty the queue"), ("compress", "Compression on/off"), ("bitrate", "Set bitrate (kbps)"),
-            ("mono", "Mono on/off"), ("rename", "Rename off/on or set pattern"), ("mode", "detect / seq")]
+            ("mono", "Mono on/off"), ("rename", "Rename off/on or set pattern"), ("onfail", "On failure: stop / skip"), ("mode", "detect / seq")]
 
 if __name__ == "__main__":
     print("AUDIOS FM bot running…")
