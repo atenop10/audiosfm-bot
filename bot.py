@@ -8,7 +8,7 @@ from pathlib import Path
 import html, threading
 import requests
 from dotenv import load_dotenv
-from pyrogram import Client, filters, idle
+from pyrogram import Client, filters
 from pyrogram.types import BotCommand, Message
 
 load_dotenv()
@@ -175,6 +175,7 @@ def human(n: float) -> str:
         n /= 1024
     return f"{n:.1f} TB"
 
+_menu_set = False
 HELP = """<b>🎧 AUDIOS FM Upload Bot</b>
 
 <b>Quick start</b>
@@ -211,7 +212,13 @@ HELP = """<b>🎧 AUDIOS FM Upload Bot</b>
 # ---------------- commands ----------------
 @app.on_message(filters.command(["start", "help"]) & filters.private)
 @admin_only
-async def cmd_help(c, m): await m.reply_text(HELP, disable_web_page_preview=True)
+async def cmd_help(c, m):
+    global _menu_set
+    await m.reply_text(HELP, disable_web_page_preview=True)
+    if not _menu_set:  # fills the "/" menu in Telegram (once per run)
+        try:
+            await c.set_bot_commands([BotCommand(n, d) for n, d in COMMANDS]); _menu_set = True
+        except Exception as e: print("Could not set command menu:", e)
 
 @app.on_message(filters.command("stories") & filters.private)
 @admin_only
@@ -471,13 +478,6 @@ COMMANDS = [("help", "Show all commands"), ("stories", "List / search stories"),
             ("clear", "Empty the queue"), ("compress", "Compression on/off"), ("bitrate", "Set bitrate (kbps)"),
             ("mono", "Mono on/off"), ("rename", "Rename off/on or set pattern"), ("mode", "detect / seq")]
 
-async def main():
-    await app.start()
-    try: await app.set_bot_commands([BotCommand(c, d) for c, d in COMMANDS])  # shows the / menu in Telegram
-    except Exception as e: print("Could not set command menu:", e)
-    print("AUDIOS FM bot running…")
-    await idle()
-    await app.stop()
-
 if __name__ == "__main__":
-    app.run(main())
+    print("AUDIOS FM bot running…")
+    app.run()
